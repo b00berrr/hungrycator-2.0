@@ -4,7 +4,7 @@
 // =====================================================================
 
 // Adres projektu, np. 'https://abcdefghijkl.supabase.co'
-export const SUPABASE_URL = 'https://qpvchecffsdnglpocxrp.supabase.co/rest/v1/';
+export const SUPABASE_URL = 'https://qpvchecffsdnglpocxrp.supabase.co';
 
 // Klucz publiczny „Publishable key” (zaczyna się od sb_publishable_)
 // albo stary klucz „anon”. Ten klucz MOŻE być publiczny.

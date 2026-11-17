@@ -32,6 +32,7 @@ const state = {
   ideaFormOpen: false, // czy formularz „Nowy pomysł” jest otwarty
   channel: null,       // połączenie Realtime
   registering: false,  // trwa zakładanie konta
+  focusAfterPaint: null, // pole do zaznaczenia po narysowaniu ekranu
 };
 
 const QUICK_REPLIES = ['Mniam!', 'Pasuje', 'Może jutro?'];
@@ -278,6 +279,14 @@ function paint(html, key) {
   if (focusId) document.getElementById(focusId)?.focus({ preventScroll: true });
   window.scrollTo(0, same ? y : 0);
   lastKey = key;
+  if (state.focusAfterPaint) {
+    const el = document.getElementById(state.focusAfterPaint);
+    state.focusAfterPaint = null;
+    if (el) {
+      el.scrollIntoView({ block: 'center' });
+      el.focus({ preventScroll: true });
+    }
+  }
 }
 
 function isTyping() {
@@ -398,100 +407,102 @@ async function screenDay(day) {
   const chatCount = {};
   messages.forEach((m) => { chatCount[m.proposal_id] = (chatCount[m.proposal_id] || 0) + 1; });
 
-  const decided = MEAL_ORDER.filter((m) => proposals.some((p) => p.meal_type === m && p.status === 'zaakceptowana')).length;
-  const paws = MEAL_ORDER.map((_, i) => paw(18, i < decided ? '#FF7A3D' : '#E3D5C7')).join('');
+  const decided = MEAL_ORDER.filter((m) => proposals.some((p) => p.meal_type === m && p.status === 'zaakceptowana'));
+  const segments = MEAL_ORDER.map((m) => `<i style="background:${decided.includes(m) ? MEALS[m].dot : '#EFE3D6'}"></i>`).join('');
   const title = day === t ? 'Co dziś jemy?' : day === addDays(t, 1) ? 'Co jutro jemy?' : 'Co jemy?';
-  const meals = MEAL_ORDER.map((m) => mealSection(m, day, proposals.filter((p) => p.meal_type === m), chatCount)).join('');
+  const cards = MEAL_ORDER.map((m) => mealCard(m, day, proposals.filter((p) => p.meal_type === m), chatCount)).join('');
 
   return `<section class="screen">
-    <header class="page-head" style="align-items:center">
+    <header class="today-head">
       <div class="grow">
-        <p class="kicker">Cześć, ${esc(state.me.name)} · ${longDate(day)}</p>
+        <p class="kicker">Cześć, ${esc(state.me.name)}!</p>
         <h1>${title}</h1>
       </div>
       <a class="avatars" href="#/ja" aria-label="Profil i ustawienia">${avatar(state.me, 42)}${state.partner ? avatar(state.partner, 42) : ''}</a>
     </header>
-    <div class="row wrap" style="justify-content:space-between">
-      <div class="row" style="gap:8px">
-        <span class="row" style="gap:3px">${paws}</span>
-        <span style="font-size:14px;font-weight:700">${decided} z 4 ustalone</span>
+    <div class="today-bar">
+      <div class="day-switch">
+        <a href="#/dzien/${addDays(day, -1)}" aria-label="Poprzedni dzień">${icon('left', 18, 2.4)}</a>
+        <span class="day-label">${mediumDate(day)}</span>
+        <a href="#/dzien/${addDays(day, 1)}" aria-label="Następny dzień">${icon('right', 18, 2.4)}</a>
       </div>
-      <div class="row" style="gap:6px">
-        ${day !== t ? '<a class="chip" href="#/" style="min-height:44px">Dziś</a>' : ''}
-        <a class="round" href="#/dzien/${addDays(day, -1)}" aria-label="Poprzedni dzień">${icon('left', 20, 2.4)}</a>
-        <a class="round" href="#/dzien/${addDays(day, 1)}" aria-label="Następny dzień">${icon('right', 20, 2.4)}</a>
-      </div>
+      <span class="mini-progress" aria-label="${decided.length} z 4 posiłków ustalone"><span class="segments" aria-hidden="true">${segments}</span>${decided.length}/4</span>
     </div>
+    ${day !== t ? '<a class="back-today" href="#/">Wróć do dziś</a>' : ''}
     ${day === t ? pushHint() : ''}
-    ${meals}
+    <div class="meals">${cards}</div>
   </section>${tabbar(day === t ? 'dzis' : 'plan')}`;
 }
 
-function mealSection(meal, day, list, chatCount) {
+// Jedna karta na posiłek: pusta, ustalona albo z propozycjami do wyboru
+function mealCard(meal, day, list, chatCount) {
+  const m = MEALS[meal];
   const accepted = list.find((p) => p.status === 'zaakceptowana');
   const pending = list.filter((p) => p.status === 'czeka');
-  let html = '';
-  if (accepted) html += acceptedCard(accepted, chatCount[accepted.id] || 0);
-  if (pending.length > 1 && !accepted) {
-    html += `<p class="small-label" style="margin:6px 0 -4px">${MEALS[meal].label}: ${pending.length} ${plural(pending.length, 'propozycja', 'propozycje', 'propozycji')}, wybierzcie jedną</p>`;
+
+  if (!accepted && !pending.length) {
+    return `<article class="meal-card empty">
+      ${mealTile(meal, 44, 22)}
+      <div class="grow"><span class="meal-label">${m.label}</span><span class="meal-empty">Nic jeszcze nie ma</span></div>
+      <a class="mini-btn soft-violet" href="#/losuj?pula=${meal}&dzien=${day}" aria-label="Kotek wylosuje: ${m.label}">${dice(20)}</a>
+      <a class="mini-btn orange" href="#/nowa?dzien=${day}&posilek=${meal}" aria-label="Zaproponuj: ${m.label}">${icon('plus', 22, 2.6)}</a>
+    </article>`;
   }
-  pending.forEach((p) => { html += pendingCard(p, chatCount[p.id] || 0, !!accepted); });
-  if (!accepted && !pending.length) html += emptyMealCard(meal, day);
-  return html;
-}
 
-function acceptedCard(p, chats) {
-  return `<a class="card card-link" href="#/propozycja/${p.id}">
-    ${mealTile(p.meal_type)}
-    <div class="grow">
-      <span class="small-label">${MEALS[p.meal_type].label}</span>
-      <div class="dish-name">${esc(p.dish_name)}</div>
-      <span class="muted" style="font-size:13px;font-weight:700">od: ${esc(person(p.author).name)}${chats ? ` · ${chats} ${plural(chats, 'wiadomość', 'wiadomości', 'wiadomości')}` : ''}</span>
-    </div>
-    <span class="pill ok">${icon('check', 14, 3)}Ustalone</span>
-  </a>`;
-}
-
-function pendingCard(p, chats, replacesAccepted) {
-  const mine = isMine(p);
-  const author = person(p.author);
-  const actions = mine
-    ? `<div class="btn-row"><button class="btn small" type="button" data-action="withdraw" data-id="${p.id}">${icon('trash', 18)}Wycofaj</button></div>`
-    : `<div class="btn-row">
-        <button class="btn primary" type="button" data-action="accept" data-id="${p.id}" style="flex:1.25">${icon('check', 18, 2.6)}Akceptuj</button>
-        <button class="btn" type="button" data-action="reject" data-id="${p.id}">${icon('x', 18, 2.4)}Odrzuć</button>
-        <a class="btn" href="#/nowa?dzien=${p.day}&posilek=${p.meal_type}">${icon('swap', 18, 2.2)}Inna</a>
-      </div>`;
-  return `<article class="sticker stack" style="gap:12px">
-    <div class="row" style="justify-content:space-between">
-      <div class="row">
-        ${mealTile(p.meal_type, 40, 20)}
-        <div>
-          <div class="small-label">${MEALS[p.meal_type].label}${replacesAccepted ? ' · zamiana?' : ''}</div>
-          <div style="font-size:14px;font-weight:700">od: ${esc(author.name)} · ${timeOf(p.created_at)}</div>
-        </div>
+  if (accepted && !pending.length) {
+    return `<a class="meal-card" href="#/propozycja/${accepted.id}">
+      ${mealTile(meal, 44, 22)}
+      <div class="grow">
+        <span class="meal-label">${m.label}</span>
+        <span class="meal-dish">${esc(accepted.dish_name)}</span>
+        <span class="meal-meta">${metaText(accepted, chatCount)}</span>
       </div>
-      <span class="pill wait">${mine ? 'Czeka na odpowiedź' : 'Czeka na Ciebie'}</span>
+      <span class="ok-dot" role="img" aria-label="Ustalone">${icon('check', 16, 3)}</span>
+    </a>`;
+  }
+
+  // Są propozycje czekające na decyzję
+  const forMe = pending.some((p) => !isMine(p));
+  const options = [accepted, ...pending].filter(Boolean);
+  const count = options.length;
+  let status = '<span class="pill grey">Czeka na odpowiedź</span>';
+  if (count > 1) status = `<span class="pill wait">${count} do wyboru</span>`;
+  else if (forMe) status = '<span class="pill wait">Twój wybór</span>';
+  return `<article class="meal-card stacked ${forMe ? 'attention' : ''}">
+    <div class="meal-top">
+      ${mealTile(meal, 34, 18)}
+      <span class="meal-label grow">${m.label}</span>
+      ${status}
     </div>
-    <h2 class="dish-big">${esc(p.dish_name)}</h2>
-    ${p.comment ? `<div class="row" style="align-items:flex-start;gap:8px">${avatar(author, 30)}<p class="bubble-note">${esc(p.comment)}</p></div>` : ''}
-    ${actions}
-    <a class="row" href="#/propozycja/${p.id}" style="min-height:44px;font-weight:800;font-size:14px;text-decoration:none;color:var(--violet-text)">
-      ${icon('chat', 18)}${chats ? `Rozmowa (${chats})` : 'Odpowiedz w rozmowie'}<span style="margin-left:auto;display:inline-flex">${icon('right', 18)}</span>
-    </a>
+    ${options.map((p) => optionRow(p, chatCount)).join('')}
   </article>`;
 }
 
-function emptyMealCard(meal, day) {
-  return `<article class="dashed stack" style="gap:12px">
-    <div class="row" style="gap:12px">${mealTile(meal)}
-      <div><span class="small-label">${MEALS[meal].label}</span><div class="dish-name">Jeszcze nic nie ma</div></div>
-    </div>
-    <div class="btn-row">
-      <a class="btn small" href="#/nowa?dzien=${day}&posilek=${meal}">${icon('plus', 18, 2.4)}Zaproponuj</a>
-      <a class="btn small violet" href="#/losuj?pula=${meal}&dzien=${day}" style="flex:1.25">${dice(18)}Kotek wylosuje</a>
-    </div>
-  </article>`;
+function metaText(p, chatCount) {
+  const chats = chatCount[p.id] || 0;
+  const who = isMine(p) ? 'Twoja propozycja' : `od: ${esc(person(p.author).name)}`;
+  return `${who}${chats ? ` · ${chats} ${plural(chats, 'wiadomość', 'wiadomości', 'wiadomości')}` : ''}`;
+}
+
+function optionRow(p, chatCount) {
+  const accepted = p.status === 'zaakceptowana';
+  const canDecide = !accepted && !isMine(p);
+  const actions = canDecide ? `<div class="choice">
+      <button class="btn primary" type="button" data-action="accept" data-id="${p.id}">${icon('check', 18, 2.6)}Akceptuj</button>
+      <button class="btn soft" type="button" data-action="reject" data-id="${p.id}">Odrzuć</button>
+      <a class="btn soft" href="#/nowa?dzien=${p.day}&posilek=${p.meal_type}">Inna</a>
+    </div>` : '';
+  return `<div class="option">
+    <a class="option-link" href="#/propozycja/${p.id}">
+      <span class="grow">
+        <span class="meal-dish">${esc(p.dish_name)}</span>
+        <span class="meal-meta">${metaText(p, chatCount)}${accepted ? ' · ustalone' : ` · ${timeOf(p.created_at)}`}</span>
+      </span>
+      ${accepted ? `<span class="ok-dot" role="img" aria-label="Ustalone">${icon('check', 16, 3)}</span>` : `<span class="chev">${icon('right', 18)}</span>`}
+    </a>
+    ${p.comment ? `<p class="note">${esc(p.comment)}</p>` : ''}
+    ${actions}
+  </div>`;
 }
 
 function pushHint() {
@@ -500,15 +511,12 @@ function pushHint() {
   const status = pushStatus();
   if (hidden || !['needs-install', 'default'].includes(status)) return '';
   const text = status === 'needs-install'
-    ? 'Dodaj Hungrycatora do ekranu początkowego, żeby dostawać powiadomienia o propozycjach.'
-    : 'Włącz powiadomienia, żeby wiedzieć, kiedy pojawi się nowa propozycja.';
-  return `<div class="card hint">
-    ${icon('bell', 22)}
-    <div class="grow stack" style="gap:6px">
-      <p style="font-size:14px;font-weight:700;line-height:1.35">${text}</p>
-      <a href="#/ja" style="font-weight:800;font-size:14px">Pokaż jak</a>
-    </div>
-    <button class="icon-btn" type="button" data-action="hide-hint" aria-label="Ukryj podpowiedź">${icon('x', 18)}</button>
+    ? 'Dodaj apkę do ekranu początkowego, żeby dostawać powiadomienia.'
+    : 'Włącz powiadomienia o nowych propozycjach.';
+  return `<div class="hint-bar">
+    ${icon('bell', 18)}
+    <a class="grow" href="#/ja">${text}</a>
+    <button class="icon-btn" type="button" data-action="hide-hint" aria-label="Ukryj podpowiedź">${icon('x', 16)}</button>
   </div>`;
 }
 
@@ -635,7 +643,7 @@ async function screenProposal(id) {
       <div class="row" style="gap:8px;font-size:14px;font-weight:700">${avatar(author, 28)}Proponuje: ${esc(author.name)}, ${timeLabel(p.created_at)}</div>
       ${statusBox(p, mine)}
     </article>
-    ${p.status === 'zaakceptowana' ? ingredientsSection(p, ingredients) : ''}
+    ${ACTIVE.includes(p.status) ? ingredientsSection(p, ingredients) : ''}
     <section class="section">
       <h2>Rozmowa</h2>
       ${thread.length ? `<div class="chat">${chat}</div>` : '<p class="muted">Napiszcie coś o tym daniu.</p>'}
@@ -698,11 +706,11 @@ function ingredientsSection(p, ingredients) {
       <h2>Składniki</h2>
       ${ingredients.length ? `<span class="muted" style="font-size:13px;font-weight:700">${haveCount} z ${ingredients.length} w lodówce</span>` : ''}
     </div>
-    <p class="row muted" style="font-size:14px;gap:6px">${icon('fridge', 16)}Dodaj składniki i odhacz to, co już macie</p>
+    <p class="row muted" style="font-size:14px;gap:6px;align-items:flex-start">${icon('fridge', 16)}<span>Wpisz, czego potrzeba (kilka naraz po przecinku), i stuknij to, co już macie w lodówce.</span></p>
     ${ingredients.length ? `<ul class="checklist">${rows}</ul>` : ''}
     <form class="inline-form" data-form="ingredient" data-id="${p.id}">
       <label class="sr-only" for="f-ing">Składnik</label>
-      <input class="field" id="f-ing" name="name" placeholder="Składnik, np. twaróg" maxlength="80" required autocomplete="off" data-keep>
+      <input class="field" id="f-ing" name="name" placeholder="np. twaróg, cebula" maxlength="300" required autocomplete="off" data-keep>
       <label class="sr-only" for="f-ing-qty">Ilość</label>
       <input class="field qty" id="f-ing-qty" name="qty" placeholder="Ilość" maxlength="40" autocomplete="off" data-keep>
       <button class="add-btn" type="submit" aria-label="Dodaj składnik">${icon('plus', 24, 2.6)}</button>
@@ -1063,6 +1071,20 @@ async function screenSettings() {
   </section>${tabbar('')}`;
 }
 
+// Natychmiast przełącz wygląd pozycji na liście (bez czekania na bazę)
+function flipCheck(button) {
+  const on = button.dataset.on !== 'true';
+  button.dataset.on = String(on);
+  button.setAttribute('aria-pressed', String(on));
+  button.closest('li')?.classList.toggle('done', on);
+  const tick = button.querySelector('.tick');
+  if (tick) {
+    tick.classList.toggle('on', on);
+    tick.innerHTML = on ? icon('check', 16, 3) : '';
+  }
+  return on;
+}
+
 // =====================================================================
 //  Kliknięcia (data-action="…")
 // =====================================================================
@@ -1140,8 +1162,14 @@ const actions = {
   },
 
   'toggle-ing': async (el) => {
-    await run(sb.from('ingredients').update({ have: el.dataset.on !== 'true' }).eq('id', Number(el.dataset.id)));
-    render();
+    const on = flipCheck(el); // wykreśl od razu, zapisz w tle
+    try {
+      await run(sb.from('ingredients').update({ have: on }).eq('id', Number(el.dataset.id)));
+    } catch (err) {
+      flipCheck(el);
+      throw err;
+    }
+    scheduleRefresh();
   },
 
   'del-ing': async (el) => {
@@ -1187,8 +1215,14 @@ const actions = {
   },
 
   'toggle-item': async (el) => {
-    await run(sb.from('shopping_items').update({ checked: el.dataset.on !== 'true' }).eq('id', Number(el.dataset.id)));
-    render();
+    const on = flipCheck(el);
+    try {
+      await run(sb.from('shopping_items').update({ checked: on }).eq('id', Number(el.dataset.id)));
+    } catch (err) {
+      flipCheck(el);
+      throw err;
+    }
+    scheduleRefresh();
   },
 
   'del-item': async (el) => {
@@ -1310,11 +1344,12 @@ const forms = {
     const dish = String(f.get('dish') || '').trim();
     const comment = String(f.get('comment') || '').trim();
     if (!dish) return toast('Wpisz nazwę dania');
-    await run(sb.from('proposals').insert({ day, meal_type: meal, dish_name: dish, comment: comment || null }));
+    const created = await run(sb.from('proposals').insert({ day, meal_type: meal, dish_name: dish, comment: comment || null }).select().single());
     if (f.get('save')) await saveDishIfNew(dish, meal);
-    toast(state.partner ? `Wysłane! ${state.partner.name} dostanie powiadomienie.` : 'Wysłane!');
+    toast('Wysłane! Dodaj od razu składniki.');
     form.reset();
-    location.hash = day === today() ? '#/' : `#/dzien/${day}`;
+    state.focusAfterPaint = 'f-ing';
+    location.hash = `#/propozycja/${created.id}`;
   },
 
   idea: async (form) => {
@@ -1330,9 +1365,13 @@ const forms = {
 
   ingredient: async (form) => {
     const f = new FormData(form);
-    const name = String(f.get('name')).trim();
-    if (!name) return;
-    await run(sb.from('ingredients').insert({ proposal_id: Number(form.dataset.id), name, qty: String(f.get('qty') || '').trim() || null }));
+    // „twaróg, cebula, śmietana” → trzy osobne składniki
+    const names = String(f.get('name')).split(/[,;\n]+/).map((n) => n.trim()).filter(Boolean)
+      .map((n) => (n.charAt(0).toUpperCase() + n.slice(1)).slice(0, 80));
+    if (!names.length) return;
+    const qty = String(f.get('qty') || '').trim() || null;
+    const proposalId = Number(form.dataset.id);
+    await run(sb.from('ingredients').insert(names.map((name) => ({ proposal_id: proposalId, name, qty: names.length === 1 ? qty : null }))));
     form.reset();
     await render();
     document.getElementById('f-ing')?.focus();

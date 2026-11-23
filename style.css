@@ -375,3 +375,27 @@ select.field { appearance: none; -webkit-appearance: none; }
 .choice .btn.primary { flex: 1; }
 .btn.soft { background: #fff; border: 1.5px solid var(--line); box-shadow: none; }
 .btn.soft:active { transform: none; background: #FAF3EC; }
+
+/* =====================================================================
+   Liczba sztuk (− 1 +) i podgląd zapisanych składników
+   ===================================================================== */
+.item-name { display: block; }
+.item-sub { display: block; font-size: 12px; font-weight: 700; color: var(--muted); margin-top: 1px; }
+.item-sub:empty { display: none; }
+.stepper {
+  display: inline-flex; align-items: center; flex-shrink: 0; background: var(--bg);
+  border: 1px solid #F0E4D8; border-radius: 999px; padding: 2px;
+}
+.stepper button {
+  width: 36px; height: 36px; border-radius: 50%; border: none; background: transparent; color: var(--ink);
+  display: inline-flex; align-items: center; justify-content: center; cursor: pointer; padding: 0;
+}
+.stepper button:active { background: #fff; }
+.stepper button[disabled] { color: #CDBBAA; cursor: default; }
+.stepper .amount { min-width: 20px; text-align: center; font-weight: 900; font-size: 15px; }
+.done .stepper { opacity: .45; }
+.saved-ing {
+  display: flex; gap: 8px; align-items: flex-start; padding: 10px 12px; border-radius: 14px;
+  background: var(--green-bg); color: var(--green); font-size: 14px; line-height: 1.4;
+}
+.saved-ing .ic { flex-shrink: 0; margin-top: 2px; }

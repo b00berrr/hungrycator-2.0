@@ -106,6 +106,7 @@ const ICONS = {
   book: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20V3H6.5A2.5 2.5 0 0 0 4 5.5Z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H20v-5"/>',
   basket: '<path d="M3 9h18l-2 11H5Z"/><path d="M8 9l4-6 4 6"/><path d="M9 13v3M15 13v3"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
+  minus: '<path d="M5 12h14"/>',
   check: '<path d="M5 12.5l4.5 4.5L19 7"/>',
   x: '<path d="M6 6l12 12M18 6L6 18"/>',
   chat: '<path d="M4 5h16v11H9l-5 4Z"/>',

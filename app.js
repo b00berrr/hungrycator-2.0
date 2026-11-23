@@ -528,7 +528,7 @@ async function screenNew(params) {
   const day = /^\d{4}-\d{2}-\d{2}$/.test(params.dzien || '') ? params.dzien : t;
   const meal = MEALS[params.posilek] ? params.posilek : mealForNow();
   const dish = params.danie || '';
-  state.dishes = await run(sb.from('dishes').select('id, name, meal_type').order('created_at', { ascending: false }));
+  state.dishes = await run(sb.from('dishes').select('id, name, meal_type, ingredients').order('created_at', { ascending: false }));
 
   const mealOptions = MEAL_ORDER.map((m) => `
     <label class="meal-option" style="--sel:${MEALS[m].tint}">
@@ -556,6 +556,7 @@ async function screenNew(params) {
         <input class="field strong" id="f-dish" name="dish" maxlength="80" required autocomplete="off"
           placeholder="np. Pierogi ruskie" value="${esc(dish)}" data-keep>
         <div id="suggestions">${suggestionsHtml(meal, dish)}</div>
+        <div id="saved-ingredients">${savedIngredientsHtml(dish)}</div>
       </div>
       <div class="stack">
         <label class="label" for="f-comment">Komentarz <span style="text-transform:none;letter-spacing:0">(opcjonalnie)</span></label>
@@ -585,11 +586,23 @@ function suggestionsHtml(meal, typed) {
   </div>`;
 }
 
+// Podgląd składników zapisanych przy tym daniu w bazie
+function savedIngredientsHtml(typed) {
+  const clean = (typed || '').trim().toLowerCase();
+  const dish = clean && state.dishes.find((d) => d.name.trim().toLowerCase() === clean);
+  const list = dish?.ingredients || [];
+  if (!list.length) return '';
+  return `<p class="saved-ing">${icon('fridge', 16)}<span><b>Składniki z bazy wstawią się same:</b> ${esc(list.map((i) => i.name).join(', '))}</span></p>`;
+}
+
 function updateSuggestions() {
   const box = document.getElementById('suggestions');
   if (!box) return;
   const meal = app.querySelector('input[name="meal"]:checked')?.value || 'obiad';
-  box.innerHTML = suggestionsHtml(meal, document.getElementById('f-dish')?.value);
+  const typed = document.getElementById('f-dish')?.value;
+  box.innerHTML = suggestionsHtml(meal, typed);
+  const saved = document.getElementById('saved-ingredients');
+  if (saved) saved.innerHTML = savedIngredientsHtml(typed);
 }
 
 function updateDayChips() {
@@ -599,11 +612,33 @@ function updateDayChips() {
 
 // Dodaj danie do bazy, jeśli jeszcze go tam nie ma. Zwraca true, gdy dodano.
 async function saveDishIfNew(name, meal, tags = []) {
-  const existing = await run(sb.from('dishes').select('id, name'));
-  const clean = name.trim().toLowerCase();
-  if (existing.some((d) => d.name.trim().toLowerCase() === clean)) return false;
+  if (await findDish(name)) return false;
   await run(sb.from('dishes').insert({ name: name.trim(), meal_type: meal, tags }));
   return true;
+}
+
+// Znajdź danie w bazie po nazwie (bez względu na wielkość liter)
+async function findDish(name) {
+  const clean = name.trim().toLowerCase();
+  const all = await run(sb.from('dishes').select('*'));
+  return all.find((d) => d.name.trim().toLowerCase() === clean) || null;
+}
+
+// Zapamiętaj składniki przy daniu w bazie, żeby następnym razem wstawiły się same
+async function rememberIngredients(proposalId) {
+  const p = await run(sb.from('proposals').select('dish_name, meal_type').eq('id', proposalId).single());
+  const list = await run(sb.from('ingredients').select('name, qty').eq('proposal_id', proposalId).order('id'));
+  const saved = list.map((i) => ({ name: i.name, qty: i.qty || null }));
+  const dish = await findDish(p.dish_name);
+  if (dish) await run(sb.from('dishes').update({ ingredients: saved }).eq('id', dish.id));
+  else await run(sb.from('dishes').insert({ name: p.dish_name.trim(), meal_type: p.meal_type, ingredients: saved }));
+}
+
+// Poproś funkcję send-push o powiadomienie drugiej osoby (w tle, bez czekania)
+function notifyPartner(body) {
+  sb.functions.invoke('send-push', { body })
+    .then(({ error }) => { if (error) console.warn('Powiadomienie nie wysłane', error); })
+    .catch((e) => console.warn('Powiadomienie nie wysłane', e));
 }
 
 // =====================================================================
@@ -693,7 +728,7 @@ function ingredientsSection(p, ingredients) {
         <span class="grow"><span class="item-name">${esc(i.name)}</span>${i.qty ? ` <span class="item-qty">${esc(i.qty)}</span>` : ''}</span>
         ${i.have ? '<span class="item-who">w lodówce</span>' : i.added_to_list ? '<span class="pill grey">na liście</span>' : '<span class="pill soft">do kupienia</span>'}
       </button>
-      <button class="icon-btn" type="button" data-action="del-ing" data-id="${i.id}" aria-label="Usuń składnik: ${esc(i.name)}">${icon('x', 18, 2.2)}</button>
+      <button class="icon-btn" type="button" data-action="del-ing" data-id="${i.id}" data-proposal="${p.id}" aria-label="Usuń składnik: ${esc(i.name)}">${icon('x', 18, 2.2)}</button>
     </li>`).join('');
   let shoppingButton = '';
   if (missing.length) {
@@ -740,7 +775,7 @@ async function screenBase(params) {
       <div class="grow">
         <div class="dish-name">${esc(d.name)}</div>
         <div class="row muted" style="gap:6px;font-size:13px;font-weight:700;margin-top:3px">
-          ${d.added_by ? avatar(person(d.added_by), 20) : ''}<span>${MEALS[d.meal_type].label}${d.tags?.length ? ` · ${esc(d.tags.join(', '))}` : ''}</span>
+          ${d.added_by ? avatar(person(d.added_by), 20) : ''}<span>${MEALS[d.meal_type].label}${d.tags?.length ? ` · ${esc(d.tags.join(', '))}` : ''}${d.ingredients?.length ? ` · ${d.ingredients.length} ${plural(d.ingredients.length, 'składnik', 'składniki', 'składników')}` : ''}</span>
         </div>
       </div>
       <button class="icon-btn" type="button" data-action="del-dish" data-id="${d.id}" data-name="${esc(d.name)}" aria-label="Usuń z bazy: ${esc(d.name)}">${icon('trash', 18)}</button>
@@ -982,9 +1017,12 @@ async function screenShopping() {
         <li class="${i.checked ? 'done' : ''}">
           <button class="check-btn" type="button" data-action="toggle-item" data-id="${i.id}" data-on="${i.checked}" aria-pressed="${i.checked}">
             <span class="tick ${i.checked ? 'on' : ''}">${i.checked ? icon('check', 16, 3) : ''}</span>
-            <span class="grow"><span class="item-name">${esc(i.name)}</span>${i.qty ? ` <span class="item-qty">${esc(i.qty)}</span>` : ''}</span>
-            ${i.added_by ? `<span class="item-who">${esc(person(i.added_by).name)}</span>` : ''}
+            <span class="grow">
+              <span class="item-name">${esc(i.name)}</span>
+              <span class="item-sub">${[i.qty ? esc(i.qty) : '', i.added_by ? esc(person(i.added_by).name) : ''].filter(Boolean).join(' · ')}</span>
+            </span>
           </button>
+          ${stepper(i)}
           <button class="icon-btn" type="button" data-action="del-item" data-id="${i.id}" aria-label="Usuń: ${esc(i.name)}">${icon('x', 18, 2.2)}</button>
         </li>`).join('')}
       </ul>
@@ -998,9 +1036,7 @@ async function screenShopping() {
     ${items.length ? `<div class="progress" aria-hidden="true"><span style="width:${percent}%"></span></div>` : ''}
     <form class="inline-form" data-form="item">
       <label class="sr-only" for="f-item">Produkt</label>
-      <input class="field" id="f-item" name="name" placeholder="Dodaj produkt…" maxlength="80" required autocomplete="off" data-keep>
-      <label class="sr-only" for="f-item-qty">Ilość</label>
-      <input class="field qty" id="f-item-qty" name="qty" placeholder="Ilość" maxlength="40" autocomplete="off" data-keep>
+      <input class="field" id="f-item" name="name" placeholder="Dodaj produkt, np. mleko, jajka" maxlength="300" required autocomplete="off" data-keep>
       <button class="add-btn" type="submit" aria-label="Dodaj produkt">${icon('plus', 24, 2.6)}</button>
     </form>
     ${items.length ? groupHtml : `<div class="dashed stack" style="align-items:center;text-align:center;gap:10px">
@@ -1010,6 +1046,16 @@ async function screenShopping() {
     </div>`}
     ${done ? `<button class="btn ghost full" type="button" data-action="clear-checked">${icon('trash', 18)}Usuń kupione (${done})</button>` : ''}
   </section>${tabbar('zakupy')}`;
+}
+
+// Małe przyciski − liczba + do zmiany liczby sztuk
+function stepper(item) {
+  const amount = item.amount || 1;
+  return `<span class="stepper" role="group" aria-label="Liczba sztuk: ${esc(item.name)}">
+    <button type="button" data-action="amount" data-id="${item.id}" data-delta="-1" aria-label="Mniej: ${esc(item.name)}" ${amount <= 1 ? 'disabled' : ''}>${icon('minus', 16, 2.6)}</button>
+    <span class="amount" aria-live="polite">${amount}</span>
+    <button type="button" data-action="amount" data-id="${item.id}" data-delta="1" aria-label="Więcej: ${esc(item.name)}">${icon('plus', 16, 2.6)}</button>
+  </span>`;
 }
 
 // =====================================================================
@@ -1071,6 +1117,8 @@ async function screenSettings() {
   </section>${tabbar('')}`;
 }
 
+const amountTimers = {}; // opóźniony zapis liczby sztuk, osobno dla każdej pozycji
+
 // Natychmiast przełącz wygląd pozycji na liście (bez czekania na bazę)
 function flipCheck(button) {
   const on = button.dataset.on !== 'true';
@@ -1117,6 +1165,7 @@ const actions = {
     // Pozostałe propozycje na ten sam posiłek przestają obowiązywać
     await run(sb.from('proposals').update({ status: 'zastapiona' })
       .eq('day', p.day).eq('meal_type', p.meal_type).in('status', ACTIVE).neq('id', id));
+    notifyPartner({ event: 'accepted', id });
     toast('Ustalone! Dodajcie składniki.');
     location.hash = `#/propozycja/${id}`;
   },
@@ -1174,6 +1223,7 @@ const actions = {
 
   'del-ing': async (el) => {
     await run(sb.from('ingredients').delete().eq('id', Number(el.dataset.id)));
+    await rememberIngredients(Number(el.dataset.proposal));
     render();
   },
 
@@ -1181,14 +1231,16 @@ const actions = {
     const id = Number(el.dataset.id);
     const missing = await run(sb.from('ingredients').select('*').eq('proposal_id', id).eq('have', false).eq('added_to_list', false));
     if (!missing.length) return;
-    await run(sb.from('shopping_items').insert(missing.map((i) => ({ name: i.name, qty: i.qty, proposal_id: id }))));
+    const added = await run(sb.from('shopping_items').insert(missing.map((i) => ({ name: i.name, qty: i.qty, proposal_id: id }))).select());
     await run(sb.from('ingredients').update({ added_to_list: true }).in('id', missing.map((i) => i.id)));
+    notifyPartner({ event: 'shopping', ids: added.map((i) => i.id) });
     toast(`Na liście zakupów: +${missing.length}`);
     render();
   },
 
   quick: async (el) => {
-    await run(sb.from('messages').insert({ proposal_id: Number(el.dataset.id), body: el.dataset.text }));
+    const msg = await run(sb.from('messages').insert({ proposal_id: Number(el.dataset.id), body: el.dataset.text }).select().single());
+    notifyPartner({ event: 'message', id: msg.id });
     render();
   },
 
@@ -1223,6 +1275,20 @@ const actions = {
       throw err;
     }
     scheduleRefresh();
+  },
+
+  amount: (el) => {
+    // Zmień liczbę od razu, a zapisz w bazie chwilę później (gdy przestaniesz klikać)
+    const box = el.closest('.stepper');
+    const label = box.querySelector('.amount');
+    const next = Math.min(99, Math.max(1, Number(label.textContent) + Number(el.dataset.delta)));
+    label.textContent = String(next);
+    box.querySelector('[data-delta="-1"]').disabled = next <= 1;
+    const id = Number(el.dataset.id);
+    clearTimeout(amountTimers[id]);
+    amountTimers[id] = setTimeout(() => {
+      run(sb.from('shopping_items').update({ amount: next }).eq('id', id)).catch(showError);
+    }, 400);
   },
 
   'del-item': async (el) => {
@@ -1346,7 +1412,14 @@ const forms = {
     if (!dish) return toast('Wpisz nazwę dania');
     const created = await run(sb.from('proposals').insert({ day, meal_type: meal, dish_name: dish, comment: comment || null }).select().single());
     if (f.get('save')) await saveDishIfNew(dish, meal);
-    toast('Wysłane! Dodaj od razu składniki.');
+    // Składniki zapamiętane przy tym daniu wstawiamy od razu
+    const saved = (await findDish(dish))?.ingredients || [];
+    if (saved.length) {
+      await run(sb.from('ingredients').insert(saved.map((i) => ({ proposal_id: created.id, name: i.name, qty: i.qty || null }))));
+      toast(`Wysłane! Składniki z bazy: ${saved.length}. Odhacz, co już macie.`);
+    } else {
+      toast('Wysłane! Dodaj od razu składniki.');
+    }
     form.reset();
     state.focusAfterPaint = 'f-ing';
     location.hash = `#/propozycja/${created.id}`;
@@ -1373,6 +1446,7 @@ const forms = {
     const proposalId = Number(form.dataset.id);
     await run(sb.from('ingredients').insert(names.map((name) => ({ proposal_id: proposalId, name, qty: names.length === 1 ? qty : null }))));
     form.reset();
+    await rememberIngredients(proposalId);
     await render();
     document.getElementById('f-ing')?.focus();
   },
@@ -1382,15 +1456,34 @@ const forms = {
     const body = String(f.get('body')).trim();
     if (!body) return;
     form.reset();
-    await run(sb.from('messages').insert({ proposal_id: Number(form.dataset.id), body }));
+    const msg = await run(sb.from('messages').insert({ proposal_id: Number(form.dataset.id), body }).select().single());
+    notifyPartner({ event: 'message', id: msg.id });
     render();
   },
 
   item: async (form) => {
     const f = new FormData(form);
-    const name = String(f.get('name')).trim();
-    if (!name) return;
-    await run(sb.from('shopping_items').insert({ name, qty: String(f.get('qty') || '').trim() || null }));
+    // „mleko, jajka” → dwie pozycje, każda po 1 sztuce
+    const names = String(f.get('name')).split(/[,;\n]+/).map((n) => n.trim()).filter(Boolean)
+      .map((n) => (n.charAt(0).toUpperCase() + n.slice(1)).slice(0, 80));
+    if (!names.length) return;
+    const onList = await run(sb.from('shopping_items').select('id, name, amount').eq('checked', false));
+    const fresh = [];
+    for (const name of names) {
+      const same = onList.find((i) => i.name.trim().toLowerCase() === name.toLowerCase());
+      if (same) {
+        // Już jest na liście: zamiast duplikatu zwiększ liczbę sztuk
+        same.amount = Math.min(99, (same.amount || 1) + 1);
+        await run(sb.from('shopping_items').update({ amount: same.amount }).eq('id', same.id));
+        toast(`${same.name}: już na liście, teraz ${same.amount} szt.`);
+      } else {
+        fresh.push({ name });
+      }
+    }
+    if (fresh.length) {
+      const added = await run(sb.from('shopping_items').insert(fresh).select());
+      notifyPartner({ event: 'shopping', ids: added.map((i) => i.id) });
+    }
     form.reset();
     await render();
     document.getElementById('f-item')?.focus();

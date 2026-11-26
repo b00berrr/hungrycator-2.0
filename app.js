@@ -14,7 +14,7 @@ import { sb, CONFIG_OK } from './db.js';
 import { VAPID_PUBLIC_KEY } from './config.js';
 import {
   MEALS, MEAL_ORDER, CATS, esc, today, addDays, mondayOf, longDate, mediumDate, shortDay,
-  relativeDay, weekRange, timeOf, isoDate, mealForNow, icon, dice, paw, cat, avatar, mealTile, mealPill,
+  relativeDay, weekRange, timeOf, isoDate, fromIso, mealForNow, icon, dice, paw, cat, avatar, mealTile, mealPill,
 } from './ui.js';
 
 const app = document.getElementById('app');
@@ -33,11 +33,51 @@ const state = {
   channel: null,       // połączenie Realtime
   registering: false,  // trwa zakładanie konta
   focusAfterPaint: null, // pole do zaznaczenia po narysowaniu ekranu
+  unseen: 0,           // ile nowych zdarzeń pod łapką
+  activityPrevSeen: null, // do kiedy zdarzenia były widziane przed wejściem do łapki
+  pushCheck: null,     // wynik „Sprawdź powiadomienia”
 };
 
 const QUICK_REPLIES = ['Mniam!', 'Pasuje', 'Może jutro?'];
 const MEAL_ACC = { sniadanie: 'śniadanie', obiad: 'obiad', kolacja: 'kolację', przekaska: 'przekąskę' };
 const ACTIVE = ['czeka', 'zaakceptowana'];
+
+// Kategorie zdarzeń w centrum powiadomień (łapce) i w ustawieniach
+const KINDS = {
+  propozycje: { label: 'Nowe propozycje', desc: 'Ktoś proponuje posiłek', icon: 'bowl', tint: '#FFE2D1' },
+  decyzje: { label: 'Akceptacje i odrzucenia', desc: 'Propozycja przyjęta, odrzucona albo wycofana', icon: 'check', tint: '#D7F3E5' },
+  wiadomosci: { label: 'Wiadomości', desc: 'Nowa wiadomość w rozmowie o daniu', icon: 'chat', tint: '#E9E2FF' },
+  skladniki: { label: 'Składniki', desc: 'Dodane albo usunięte składniki dania', icon: 'fridge', tint: '#FFF0BF' },
+  zakupy_nowe: { label: 'Nowe produkty na liście', desc: 'Ktoś dopisuje coś do zakupów', icon: 'plus', tint: '#FFE2D1' },
+  zakupy_zmiany: { label: 'Zmiany na liście zakupów', desc: 'Liczba sztuk, usunięte produkty', icon: 'swap', tint: '#FFDCE8' },
+  zakupy_kupione: { label: 'Zrobione zakupy', desc: 'Ktoś odhacza produkty jako kupione', icon: 'basket', tint: '#D7F3E5' },
+  baza: { label: 'Nowe pomysły w bazie', desc: 'Nowe danie zapisane na kiedyś', icon: 'book', tint: '#E9E2FF' },
+};
+
+// „na dzisiejszy obiad”, „na jutrzejszą kolację”, „na obiad w czwartek (20.11)”
+const MEAL_GENDER = { sniadanie: 'n', obiad: 'm', kolacja: 'f', przekaska: 'f' };
+const TODAY_ADJ = { m: 'dzisiejszy', f: 'dzisiejszą', n: 'dzisiejsze' };
+const TOMORROW_ADJ = { m: 'jutrzejszy', f: 'jutrzejszą', n: 'jutrzejsze' };
+const ON_DAY = ['w niedzielę', 'w poniedziałek', 'we wtorek', 'w środę', 'w czwartek', 'w piątek', 'w sobotę'];
+function whenText(day, meal) {
+  const gender = MEAL_GENDER[meal] || 'm';
+  const acc = MEAL_ACC[meal] || 'obiad';
+  const t = today();
+  if (day === t) return `na ${TODAY_ADJ[gender]} ${acc}`;
+  if (day === addDays(t, 1)) return `na ${TOMORROW_ADJ[gender]} ${acc}`;
+  const d = fromIso(day);
+  return `na ${acc} ${ON_DAY[d.getDay()]} (${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')})`;
+}
+
+function shorten(text, max) {
+  const clean = String(text ?? '').replace(/\s+/g, ' ').trim();
+  return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
+}
+
+// „Mleko, Jajka i 3 więcej”
+function listText(names) {
+  return names.length > 6 ? `${names.slice(0, 5).join(', ')} i ${names.length - 5} więcej` : names.join(', ');
+}
 
 // =====================================================================
 //  Pomocniki
@@ -48,6 +88,42 @@ async function run(query) {
   const { data, error } = await query;
   if (error) throw error;
   return data;
+}
+
+// Jak run(), ale przy błędzie zwraca pustą listę (np. gdy tabela jeszcze nie istnieje)
+async function safeRun(query) {
+  try {
+    const { data, error } = await query;
+    if (error) {
+      console.warn(error.message);
+      return [];
+    }
+    return data || [];
+  } catch (e) {
+    console.warn(e);
+    return [];
+  }
+}
+
+// Ile nowych zdarzeń od drugiej osoby czeka pod łapką
+async function refreshUnseen() {
+  let query = sb.from('activity').select('id, kind').neq('actor', state.me.id).order('created_at', { ascending: false }).limit(50);
+  if (state.me.activity_seen_at) query = query.gt('created_at', state.me.activity_seen_at);
+  const rows = await safeRun(query);
+  const prefs = state.me.notify_prefs || {};
+  state.unseen = rows.filter((r) => prefs[r.kind] !== false).length;
+}
+
+// Ile wiadomości od drugiej osoby jeszcze nie przeczytałam (dla każdej propozycji)
+function unreadCounts(messages, reads) {
+  const lastRead = Object.fromEntries(reads.map((r) => [r.proposal_id, r.last_read_at]));
+  const counts = {};
+  for (const m of messages) {
+    if (m.author === state.me.id) continue;
+    const seen = lastRead[m.proposal_id];
+    if (!seen || new Date(m.created_at) > new Date(seen)) counts[m.proposal_id] = (counts[m.proposal_id] || 0) + 1;
+  }
+  return counts;
 }
 
 function person(id) {
@@ -222,6 +298,7 @@ async function screenFor({ parts, params }) {
     case 'plan': return screenPlan(params);
     case 'zakupy': return screenShopping();
     case 'ja': return screenSettings();
+    case 'powiadomienia': return screenActivity();
     default: return screenDay(today());
   }
 }
@@ -241,6 +318,7 @@ async function render() {
     key = 'profile';
   } else {
     try {
+      await refreshUnseen();
       html = await screenFor(route);
     } catch (err) {
       console.error(err);
@@ -313,7 +391,8 @@ function scheduleRefresh() {
 function tabbar(active) {
   const tab = (key, label, ic, href) => {
     const on = active === key;
-    return `<a class="tab" href="${href}" ${on ? 'aria-current="page"' : ''}><span class="pillbg">${icon(ic, 22, on ? 2.3 : 2)}</span><span>${label}</span></a>`;
+    const dot = key === 'dzis' && state.unseen ? '<i class="tab-dot" aria-hidden="true"></i>' : '';
+    return `<a class="tab" href="${href}" ${on ? 'aria-current="page"' : ''}><span class="pillbg">${icon(ic, 22, on ? 2.3 : 2)}${dot}</span><span>${label}</span></a>`;
   };
   return `<nav class="tabbar" aria-label="Zakładki"><div class="inner">
     ${tab('dzis', 'Dziś', 'plate', '#/')}
@@ -403,14 +482,14 @@ async function screenDay(day) {
   const t = today();
   const proposals = await run(sb.from('proposals').select('*').eq('day', day).in('status', ACTIVE).order('created_at'));
   const ids = proposals.map((p) => p.id);
-  const messages = ids.length ? await run(sb.from('messages').select('id, proposal_id').in('proposal_id', ids)) : [];
-  const chatCount = {};
-  messages.forEach((m) => { chatCount[m.proposal_id] = (chatCount[m.proposal_id] || 0) + 1; });
+  const messages = ids.length ? await run(sb.from('messages').select('id, proposal_id, author, created_at').in('proposal_id', ids)) : [];
+  const reads = ids.length ? await safeRun(sb.from('message_reads').select('proposal_id, last_read_at').eq('user_id', state.me.id).in('proposal_id', ids)) : [];
+  const unread = unreadCounts(messages, reads);
 
   const decided = MEAL_ORDER.filter((m) => proposals.some((p) => p.meal_type === m && p.status === 'zaakceptowana'));
   const segments = MEAL_ORDER.map((m) => `<i style="background:${decided.includes(m) ? MEALS[m].dot : '#EFE3D6'}"></i>`).join('');
   const title = day === t ? 'Co dziś jemy?' : day === addDays(t, 1) ? 'Co jutro jemy?' : 'Co jemy?';
-  const cards = MEAL_ORDER.map((m) => mealCard(m, day, proposals.filter((p) => p.meal_type === m), chatCount)).join('');
+  const cards = MEAL_ORDER.map((m) => mealCard(m, day, proposals.filter((p) => p.meal_type === m), unread)).join('');
 
   return `<section class="screen">
     <header class="today-head">
@@ -418,7 +497,10 @@ async function screenDay(day) {
         <p class="kicker">Cześć, ${esc(state.me.name)}!</p>
         <h1>${title}</h1>
       </div>
-      <a class="avatars" href="#/ja" aria-label="Profil i ustawienia">${avatar(state.me, 42)}${state.partner ? avatar(state.partner, 42) : ''}</a>
+      <div class="row" style="gap:10px;flex-shrink:0">
+        ${bellButton()}
+        <a class="avatars" href="#/ja" aria-label="Profil i ustawienia">${avatar(state.me, 42)}${state.partner ? avatar(state.partner, 42) : ''}</a>
+      </div>
     </header>
     <div class="today-bar">
       <div class="day-switch">
@@ -435,7 +517,7 @@ async function screenDay(day) {
 }
 
 // Jedna karta na posiłek: pusta, ustalona albo z propozycjami do wyboru
-function mealCard(meal, day, list, chatCount) {
+function mealCard(meal, day, list, unread) {
   const m = MEALS[meal];
   const accepted = list.find((p) => p.status === 'zaakceptowana');
   const pending = list.filter((p) => p.status === 'czeka');
@@ -455,7 +537,7 @@ function mealCard(meal, day, list, chatCount) {
       <div class="grow">
         <span class="meal-label">${m.label}</span>
         <span class="meal-dish">${esc(accepted.dish_name)}</span>
-        <span class="meal-meta">${metaText(accepted, chatCount)}</span>
+        <span class="meal-meta">${metaText(accepted, unread)}</span>
       </div>
       <span class="ok-dot" role="img" aria-label="Ustalone">${icon('check', 16, 3)}</span>
     </a>`;
@@ -474,17 +556,25 @@ function mealCard(meal, day, list, chatCount) {
       <span class="meal-label grow">${m.label}</span>
       ${status}
     </div>
-    ${options.map((p) => optionRow(p, chatCount)).join('')}
+    ${options.map((p) => optionRow(p, unread)).join('')}
   </article>`;
 }
 
-function metaText(p, chatCount) {
-  const chats = chatCount[p.id] || 0;
+function metaText(p, unread) {
+  const n = unread[p.id] || 0;
   const who = isMine(p) ? 'Twoja propozycja' : `od: ${esc(person(p.author).name)}`;
-  return `${who}${chats ? ` · ${chats} ${plural(chats, 'wiadomość', 'wiadomości', 'wiadomości')}` : ''}`;
+  return `${who}${n ? ` · <span class="unread">${n} ${plural(n, 'nowa wiadomość', 'nowe wiadomości', 'nowych wiadomości')}</span>` : ''}`;
 }
 
-function optionRow(p, chatCount) {
+// Kocia łapka z czerwonym licznikiem: wejście do centrum powiadomień
+function bellButton() {
+  const n = state.unseen || 0;
+  return `<a class="bell" href="#/powiadomienia" aria-label="Centrum powiadomień${n ? `, nowe: ${n}` : ''}">
+    ${paw(24, '#FF7A3D')}${n ? `<span class="badge">${n > 9 ? '9+' : n}</span>` : ''}
+  </a>`;
+}
+
+function optionRow(p, unread) {
   const accepted = p.status === 'zaakceptowana';
   const canDecide = !accepted && !isMine(p);
   const actions = canDecide ? `<div class="choice">
@@ -496,7 +586,7 @@ function optionRow(p, chatCount) {
     <a class="option-link" href="#/propozycja/${p.id}">
       <span class="grow">
         <span class="meal-dish">${esc(p.dish_name)}</span>
-        <span class="meal-meta">${metaText(p, chatCount)}${accepted ? ' · ustalone' : ` · ${timeOf(p.created_at)}`}</span>
+        <span class="meal-meta">${metaText(p, unread)}${accepted ? ' · ustalone' : ` · ${timeOf(p.created_at)}`}</span>
       </span>
       ${accepted ? `<span class="ok-dot" role="img" aria-label="Ustalone">${icon('check', 16, 3)}</span>` : `<span class="chev">${icon('right', 18)}</span>`}
     </a>
@@ -512,7 +602,7 @@ function pushHint() {
   if (hidden || !['needs-install', 'default'].includes(status)) return '';
   const text = status === 'needs-install'
     ? 'Dodaj apkę do ekranu początkowego, żeby dostawać powiadomienia.'
-    : 'Włącz powiadomienia o nowych propozycjach.';
+    : 'Włącz powiadomienia, żeby wiedzieć o zmianach.';
   return `<div class="hint-bar">
     ${icon('bell', 18)}
     <a class="grow" href="#/ja">${text}</a>
@@ -634,11 +724,32 @@ async function rememberIngredients(proposalId) {
   else await run(sb.from('dishes').insert({ name: p.dish_name.trim(), meal_type: p.meal_type, ingredients: saved }));
 }
 
-// Poproś funkcję send-push o powiadomienie drugiej osoby (w tle, bez czekania)
-function notifyPartner(body) {
-  sb.functions.invoke('send-push', { body })
-    .then(({ error }) => { if (error) console.warn('Powiadomienie nie wysłane', error); })
-    .catch((e) => console.warn('Powiadomienie nie wysłane', e));
+// Nazwa funkcji od powiadomień w Supabase (Edge Functions)
+const PUSH_FUNCTION = 'swift-action';
+
+// Zamień błąd wywołania funkcji na zrozumiały opis
+async function describeFunctionError(error) {
+  const status = error?.context?.status;
+  let text = '';
+  try {
+    const body = await error.context.json();
+    text = body?.problem || body?.reason || body?.error || body?.message || body?.msg || '';
+  } catch (e) { /* brak treści */ }
+  if (status === 404) return `Nie ma funkcji o nazwie ${PUSH_FUNCTION}. Sprawdź nazwę w Edge Functions.`;
+  if (status === 401) return text || 'Wyłącz „Enforce JWT verification” w ustawieniach funkcji.';
+  if (status >= 500) return `Funkcja ma błąd albo nie wystartowała${text ? ` (${text})` : ''}. Wklej kod jeszcze raz i kliknij Deploy.`;
+  if (!status) return 'Brak połączenia z funkcją. Sprawdź internet i nazwę funkcji.';
+  return `Kod ${status}${text ? `: ${text}` : ''}`;
+}
+
+// Zapisz zdarzenie w historii (łapka). Webhook na tabeli activity
+// wyśle z niego powiadomienie na telefon drugiej osoby.
+async function logActivity(kind, title, body, url = '#/', proposalId = null) {
+  try {
+    await run(sb.from('activity').insert({ kind, title: shorten(title, 120), body: shorten(body, 300), url, proposal_id: proposalId }));
+  } catch (e) {
+    console.warn('Nie zapisano zdarzenia', e);
+  }
 }
 
 // =====================================================================
@@ -658,13 +769,26 @@ async function screenProposal(id) {
   const author = person(p.author);
   const mine = isMine(p);
 
+  // Odczytane wiadomości: zapisz, że widzę już wszystko, i sprawdź, co przeczytała druga osoba
+  const reads = await safeRun(sb.from('message_reads').select('*').eq('proposal_id', id));
+  const myRead = reads.find((r) => r.user_id === state.me.id);
+  const partnerRead = reads.find((r) => r.user_id !== state.me.id);
+  const lastFromOthers = [...messages].reverse().find((m) => m.author !== state.me.id);
+  if (lastFromOthers && (!myRead || new Date(lastFromOthers.created_at) > new Date(myRead.last_read_at))) {
+    const newest = messages[messages.length - 1].created_at;
+    safeRun(sb.from('message_reads').upsert({ user_id: state.me.id, proposal_id: id, last_read_at: newest }, { onConflict: 'user_id,proposal_id' }));
+  }
+  const lastMine = [...messages].reverse().find((m) => m.author === state.me.id);
+  const seenByPartner = !!(lastMine && partnerRead && new Date(partnerRead.last_read_at) >= new Date(lastMine.created_at));
+
   // Dymki rozmowy: komentarz z propozycji jest pierwszą wiadomością
   const thread = [];
   if (p.comment) thread.push({ author: p.author, body: p.comment, created_at: p.created_at });
   thread.push(...messages);
   const chat = thread.map((m) => {
     if (m.author === state.me.id) {
-      return `<div class="msg mine"><p>${esc(m.body)}</p><small>Ty · ${timeLabel(m.created_at)}</small></div>`;
+      const seen = m === lastMine && seenByPartner ? ` · <span class="seen">${icon('check', 12, 3)}Przeczytane</span>` : '';
+      return `<div class="msg mine"><p>${esc(m.body)}</p><small>Ty · ${timeLabel(m.created_at)}${seen}</small></div>`;
     }
     const who = person(m.author);
     return `<div class="msg theirs">${avatar(who, 30)}<div class="stack" style="gap:3px"><p>${esc(m.body)}</p><small>${esc(who.name)} · ${timeLabel(m.created_at)}</small></div></div>`;
@@ -682,8 +806,8 @@ async function screenProposal(id) {
     <section class="section">
       <h2>Rozmowa</h2>
       ${thread.length ? `<div class="chat">${chat}</div>` : '<p class="muted">Napiszcie coś o tym daniu.</p>'}
-      <div class="chips">${QUICK_REPLIES.map((q) => `<button class="chip" type="button" data-action="quick" data-id="${p.id}" data-text="${esc(q)}">${esc(q)}</button>`).join('')}</div>
-      <form class="chat-form" data-form="message" data-id="${p.id}">
+      <div class="chips">${QUICK_REPLIES.map((q) => `<button class="chip" type="button" data-action="quick" data-id="${p.id}" data-dish="${esc(p.dish_name)}" data-text="${esc(q)}">${esc(q)}</button>`).join('')}</div>
+      <form class="chat-form" data-form="message" data-id="${p.id}" data-dish="${esc(p.dish_name)}">
         <label class="sr-only" for="f-msg">Wiadomość</label>
         <input class="field" id="f-msg" name="body" placeholder="Napisz wiadomość…" maxlength="1000" autocomplete="off" required data-keep>
         <button class="send-btn" type="submit" aria-label="Wyślij wiadomość">${icon('send', 20, 2.2)}</button>
@@ -728,11 +852,11 @@ function ingredientsSection(p, ingredients) {
         <span class="grow"><span class="item-name">${esc(i.name)}</span>${i.qty ? ` <span class="item-qty">${esc(i.qty)}</span>` : ''}</span>
         ${i.have ? '<span class="item-who">w lodówce</span>' : i.added_to_list ? '<span class="pill grey">na liście</span>' : '<span class="pill soft">do kupienia</span>'}
       </button>
-      <button class="icon-btn" type="button" data-action="del-ing" data-id="${i.id}" data-proposal="${p.id}" aria-label="Usuń składnik: ${esc(i.name)}">${icon('x', 18, 2.2)}</button>
+      <button class="icon-btn" type="button" data-action="del-ing" data-id="${i.id}" data-proposal="${p.id}" data-dish="${esc(p.dish_name)}" data-name="${esc(i.name)}" aria-label="Usuń składnik: ${esc(i.name)}">${icon('x', 18, 2.2)}</button>
     </li>`).join('');
   let shoppingButton = '';
   if (missing.length) {
-    shoppingButton = `<button class="btn primary full" type="button" data-action="to-shopping" data-id="${p.id}">${icon('basket', 20, 2.2)}Dodaj ${missing.length} ${plural(missing.length, 'brakujący', 'brakujące', 'brakujących')} do zakupów</button>`;
+    shoppingButton = `<button class="btn primary full" type="button" data-action="to-shopping" data-id="${p.id}" data-dish="${esc(p.dish_name)}">${icon('basket', 20, 2.2)}Dodaj ${missing.length} ${plural(missing.length, 'brakujący', 'brakujące', 'brakujących')} do zakupów</button>`;
   } else if (onList) {
     shoppingButton = `<a class="btn full" href="#/zakupy">${icon('basket', 20)}Zobacz listę zakupów</a>`;
   }
@@ -743,7 +867,7 @@ function ingredientsSection(p, ingredients) {
     </div>
     <p class="row muted" style="font-size:14px;gap:6px;align-items:flex-start">${icon('fridge', 16)}<span>Wpisz, czego potrzeba (kilka naraz po przecinku), i stuknij to, co już macie w lodówce.</span></p>
     ${ingredients.length ? `<ul class="checklist">${rows}</ul>` : ''}
-    <form class="inline-form" data-form="ingredient" data-id="${p.id}">
+    <form class="inline-form" data-form="ingredient" data-id="${p.id}" data-dish="${esc(p.dish_name)}">
       <label class="sr-only" for="f-ing">Składnik</label>
       <input class="field" id="f-ing" name="name" placeholder="np. twaróg, cebula" maxlength="300" required autocomplete="off" data-keep>
       <label class="sr-only" for="f-ing-qty">Ilość</label>
@@ -1015,7 +1139,7 @@ async function screenShopping() {
       <div class="row" style="align-items:baseline;gap:8px"><h2 style="font-size:17px">${esc(g.title)}</h2><span class="muted" style="font-size:12px;font-weight:700">${esc(g.sub)}</span></div>
       <ul class="checklist">${g.items.map((i) => `
         <li class="${i.checked ? 'done' : ''}">
-          <button class="check-btn" type="button" data-action="toggle-item" data-id="${i.id}" data-on="${i.checked}" aria-pressed="${i.checked}">
+          <button class="check-btn" type="button" data-action="toggle-item" data-id="${i.id}" data-on="${i.checked}" aria-pressed="${i.checked}" data-proposal="${i.proposal_id || ''}" data-name="${esc(i.name)}">
             <span class="tick ${i.checked ? 'on' : ''}">${i.checked ? icon('check', 16, 3) : ''}</span>
             <span class="grow">
               <span class="item-name">${esc(i.name)}</span>
@@ -1023,7 +1147,7 @@ async function screenShopping() {
             </span>
           </button>
           ${stepper(i)}
-          <button class="icon-btn" type="button" data-action="del-item" data-id="${i.id}" aria-label="Usuń: ${esc(i.name)}">${icon('x', 18, 2.2)}</button>
+          <button class="icon-btn" type="button" data-action="del-item" data-id="${i.id}" data-name="${esc(i.name)}" aria-label="Usuń: ${esc(i.name)}">${icon('x', 18, 2.2)}</button>
         </li>`).join('')}
       </ul>
     </section>`).join('');
@@ -1051,11 +1175,72 @@ async function screenShopping() {
 // Małe przyciski − liczba + do zmiany liczby sztuk
 function stepper(item) {
   const amount = item.amount || 1;
-  return `<span class="stepper" role="group" aria-label="Liczba sztuk: ${esc(item.name)}">
+  return `<span class="stepper" role="group" data-name="${esc(item.name)}" aria-label="Liczba sztuk: ${esc(item.name)}">
     <button type="button" data-action="amount" data-id="${item.id}" data-delta="-1" aria-label="Mniej: ${esc(item.name)}" ${amount <= 1 ? 'disabled' : ''}>${icon('minus', 16, 2.6)}</button>
     <span class="amount" aria-live="polite">${amount}</span>
     <button type="button" data-action="amount" data-id="${item.id}" data-delta="1" aria-label="Więcej: ${esc(item.name)}">${icon('plus', 16, 2.6)}</button>
   </span>`;
+}
+
+// =====================================================================
+//  Ekran: centrum powiadomień (kocia łapka)
+// =====================================================================
+async function screenActivity() {
+  const rows = await safeRun(sb.from('activity').select('*').neq('actor', state.me.id).order('created_at', { ascending: false }).limit(80));
+  const prefs = state.me.notify_prefs || {};
+  const list = rows.filter((r) => KINDS[r.kind] && prefs[r.kind] !== false);
+
+  // Co było nowe w chwili wejścia (podświetlamy to do końca tej wizyty)
+  if (lastKey !== '/powiadomienia') state.activityPrevSeen = state.me.activity_seen_at || null;
+  const prevSeen = state.activityPrevSeen ? new Date(state.activityPrevSeen) : null;
+
+  // Oznacz wszystko jako zobaczone (czas z bazy, nie z telefonu)
+  const newest = rows[0]?.created_at;
+  if (newest && (!state.me.activity_seen_at || new Date(newest) > new Date(state.me.activity_seen_at))) {
+    state.me.activity_seen_at = newest;
+    state.unseen = 0;
+    safeRun(sb.from('profiles').update({ activity_seen_at: newest }).eq('id', state.me.id));
+  }
+
+  // Grupy po dniach: Dziś, Wczoraj, wtorek 17 listopada…
+  const groups = [];
+  for (const r of list) {
+    const day = isoDate(new Date(r.created_at));
+    const label = day === today() ? 'Dziś' : day === addDays(today(), -1) ? 'Wczoraj' : longDate(day);
+    if (!groups.length || groups[groups.length - 1].label !== label) groups.push({ label, items: [] });
+    groups[groups.length - 1].items.push(r);
+  }
+
+  const html = groups.map((g) => `
+    <section class="stack" style="gap:8px">
+      <h2 class="small-label">${esc(g.label)}</h2>
+      <ul class="act-list">${g.items.map((r) => {
+        const k = KINDS[r.kind];
+        const isNew = !prevSeen || new Date(r.created_at) > prevSeen;
+        const url = String(r.url || '').startsWith('#/') ? r.url : '#/';
+        return `<li><a class="act ${isNew ? 'new' : ''}" href="${esc(url)}">
+          <span class="tile" style="width:40px;height:40px;background:${k.tint}">${icon(k.icon, 20)}</span>
+          <span class="grow">
+            <span class="act-title">${esc(r.title)}</span>
+            <span class="act-body">${esc(r.body)}</span>
+            <span class="act-time">${timeOf(r.created_at)}</span>
+          </span>
+          ${isNew ? '<i class="new-dot" role="img" aria-label="Nowe"></i>' : ''}
+        </a></li>`;
+      }).join('')}</ul>
+    </section>`).join('');
+
+  const empty = `<div class="dashed stack" style="align-items:center;text-align:center;gap:10px;margin-top:10px">
+    ${cat(72, 'biala')}
+    <p style="font-weight:800">Na razie cisza</p>
+    <p class="muted" style="font-size:14px">Tu pojawi się wszystko, co zmieni druga osoba: propozycje, wiadomości, zakupy.</p>
+  </div>`;
+
+  return `<section class="screen">
+    <header class="topbar">${backButton('#/')}<h1>Powiadomienia</h1><a class="round" href="#/ja" aria-label="Ustawienia powiadomień">${icon('bell', 20)}</a></header>
+    ${list.length ? html : empty}
+    <a class="btn ghost full" href="#/ja">Wybierz, o czym chcesz wiedzieć</a>
+  </section>${tabbar('')}`;
 }
 
 // =====================================================================
@@ -1087,11 +1272,29 @@ async function screenSettings() {
       <span class="pill ok">${icon('check', 14, 3)}Powiadomienia włączone</span>
       <button class="btn small" type="button" data-action="disable-push">Wyłącz</button>
     </div>
-    <p class="muted" style="font-size:14px">Dostaniesz powiadomienie, gdy druga osoba zaproponuje posiłek.</p>`;
+    <p class="muted" style="font-size:14px">Niżej wybierzesz, o czym chcesz dostawać powiadomienia.</p>`;
   } else {
-    push = `<p style="font-size:15px;line-height:1.45">Dostaniesz powiadomienie, gdy druga osoba zaproponuje posiłek.</p>
+    push = `<p style="font-size:15px;line-height:1.45">Dostaniesz powiadomienie, gdy druga osoba coś zmieni, np. zaproponuje posiłek.</p>
       <button class="btn primary full" type="button" data-action="enable-push">${icon('bell', 20)}Włącz powiadomienia</button>`;
   }
+
+  // Wynik „Sprawdź powiadomienia”
+  const check = state.pushCheck ? `<ul class="check-list">${state.pushCheck.map(([label, ok, note]) => `
+      <li class="${ok ? 'ok' : 'bad'}">
+        <span class="mark">${icon(ok ? 'check' : 'x', 14, 3)}</span>
+        <span class="grow">${esc(label)}${note ? `<small>${esc(note)}</small>` : ''}</span>
+      </li>`).join('')}</ul>
+    <p class="muted" style="font-size:13px;line-height:1.4">Próbne powiadomienie przychodzi, a zwykłe nie? Sprawdź w Supabase webhook (Integrations → Database Webhooks: tabela <b>activity</b>, zdarzenie Insert, funkcja ${PUSH_FUNCTION}).</p>` : '';
+  push += `${status !== 'unsupported' ? `<button class="btn full" type="button" data-action="check-push">${icon('search', 18)}Sprawdź, czy działają</button>` : ''}${check}`;
+
+  // Kategorie: co chcę dostawać
+  const prefs = state.me.notify_prefs || {};
+  const prefRows = Object.entries(KINDS).map(([key, k]) => `
+    <li class="pref-row">
+      <span class="tile" style="width:36px;height:36px;background:${k.tint}">${icon(k.icon, 18)}</span>
+      <span class="grow"><span class="pref-label">${k.label}</span><span class="pref-desc">${k.desc}</span></span>
+      <label class="switch"><input type="checkbox" data-pref="${key}" ${prefs[key] !== false ? 'checked' : ''} aria-label="${k.label}"><span></span></label>
+    </li>`).join('');
 
   const partner = state.partner
     ? `<div class="row">${avatar(state.partner, 44)}<div><div class="dish-name">${esc(state.partner.name)}</div><span class="muted" style="font-size:13px;font-weight:700">planuje z Tobą posiłki</span></div></div>`
@@ -1103,6 +1306,11 @@ async function screenSettings() {
     <section class="sticker stack" style="gap:10px">
       <h2 class="row" style="font-size:20px">${icon('bell', 22)}Powiadomienia</h2>
       ${push}
+    </section>
+    <section class="card stack" style="padding:16px" id="kategorie">
+      <h2 style="font-size:20px">Co chcesz dostawać</h2>
+      <p class="muted" style="font-size:14px;line-height:1.4">Wyłączone rzeczy nie przyjdą na telefon i nie pojawią się pod kocią łapką.</p>
+      <ul class="pref-list">${prefRows}</ul>
     </section>
     <section class="card stack" style="padding:16px">
       <h2 style="font-size:20px">Druga osoba</h2>
@@ -1118,6 +1326,13 @@ async function screenSettings() {
 }
 
 const amountTimers = {}; // opóźniony zapis liczby sztuk, osobno dla każdej pozycji
+
+// Rzecz z listy zakupów kupiona → przy składniku konkretnego dania zaznacz „mamy”.
+// Dotyczy tylko tej jednej propozycji (np. dzisiejszego rosołu), nie bazy dań.
+async function syncIngredient(proposalId, name, have) {
+  if (!proposalId || !name) return;
+  await run(sb.from('ingredients').update({ have }).eq('proposal_id', Number(proposalId)).eq('name', name));
+}
 
 // Natychmiast przełącz wygląd pozycji na liście (bez czekania na bazę)
 function flipCheck(button) {
@@ -1165,22 +1380,28 @@ const actions = {
     // Pozostałe propozycje na ten sam posiłek przestają obowiązywać
     await run(sb.from('proposals').update({ status: 'zastapiona' })
       .eq('day', p.day).eq('meal_type', p.meal_type).in('status', ACTIVE).neq('id', id));
-    notifyPartner({ event: 'accepted', id });
+    logActivity('decyzje', 'Propozycja przyjęta', `${state.me.name} akceptuje ${p.dish_name} ${whenText(p.day, p.meal_type)}`, `#/propozycja/${id}`, id);
     toast('Ustalone! Dodajcie składniki.');
     location.hash = `#/propozycja/${id}`;
   },
 
   reject: async (el) => {
+    const id = Number(el.dataset.id);
+    const p = await run(sb.from('proposals').select('*').eq('id', id).single());
     await run(sb.from('proposals').update({
       status: 'odrzucona', decided_by: state.me.id, decided_at: new Date().toISOString(),
-    }).eq('id', Number(el.dataset.id)));
+    }).eq('id', id));
+    logActivity('decyzje', 'Propozycja odrzucona', `${state.me.name} odrzuca ${p.dish_name} ${whenText(p.day, p.meal_type)}`, `#/dzien/${p.day}`, id);
     toast('Odrzucone. Może kotek coś wylosuje?');
     render();
   },
 
   withdraw: async (el) => {
     if (!confirm('Wycofać tę propozycję?')) return;
-    await run(sb.from('proposals').delete().eq('id', Number(el.dataset.id)));
+    const id = Number(el.dataset.id);
+    const p = await run(sb.from('proposals').select('*').eq('id', id).single());
+    await logActivity('decyzje', 'Propozycja wycofana', `${state.me.name} wycofuje ${p.dish_name} (${whenText(p.day, p.meal_type)})`, `#/dzien/${p.day}`, id);
+    await run(sb.from('proposals').delete().eq('id', id));
     toast('Propozycja wycofana');
     if (parseRoute().parts[0] === 'propozycja') location.hash = '#/';
     else render();
@@ -1206,6 +1427,7 @@ const actions = {
       return;
     }
     const added = await saveDishIfNew(name, f.get('meal'));
+    if (added) logActivity('baza', 'Nowy pomysł w bazie', `${state.me.name} zapisuje na kiedyś: ${name}`, '#/baza');
     toast(added ? 'Zapisane w bazie dań' : 'To danie już jest w bazie');
     location.hash = '#/baza';
   },
@@ -1224,6 +1446,7 @@ const actions = {
   'del-ing': async (el) => {
     await run(sb.from('ingredients').delete().eq('id', Number(el.dataset.id)));
     await rememberIngredients(Number(el.dataset.proposal));
+    logActivity('skladniki', `Składniki: ${el.dataset.dish}`, `${state.me.name} usuwa: ${el.dataset.name}`, `#/propozycja/${el.dataset.proposal}`, Number(el.dataset.proposal));
     render();
   },
 
@@ -1233,14 +1456,15 @@ const actions = {
     if (!missing.length) return;
     const added = await run(sb.from('shopping_items').insert(missing.map((i) => ({ name: i.name, qty: i.qty, proposal_id: id }))).select());
     await run(sb.from('ingredients').update({ added_to_list: true }).in('id', missing.map((i) => i.id)));
-    notifyPartner({ event: 'shopping', ids: added.map((i) => i.id) });
+    logActivity('zakupy_nowe', 'Lista zakupów', `${state.me.name} dodaje: ${listText(added.map((i) => i.name))} (do: ${el.dataset.dish})`, '#/zakupy', id);
     toast(`Na liście zakupów: +${missing.length}`);
     render();
   },
 
   quick: async (el) => {
-    const msg = await run(sb.from('messages').insert({ proposal_id: Number(el.dataset.id), body: el.dataset.text }).select().single());
-    notifyPartner({ event: 'message', id: msg.id });
+    const id = Number(el.dataset.id);
+    await run(sb.from('messages').insert({ proposal_id: id, body: el.dataset.text }));
+    logActivity('wiadomosci', `Wiadomość: ${el.dataset.dish}`, `${state.me.name}: ${el.dataset.text}`, `#/propozycja/${id}`, id);
     render();
   },
 
@@ -1274,6 +1498,9 @@ const actions = {
       flipCheck(el);
       throw err;
     }
+    // Kupione = „mamy w lodówce” przy składniku tego dania (i odwrotnie po odznaczeniu)
+    await syncIngredient(el.dataset.proposal, el.dataset.name, on);
+    if (on) logActivity('zakupy_kupione', 'Zakupy', `${state.me.name} odhacza jako kupione: ${el.dataset.name}`, '#/zakupy');
     scheduleRefresh();
   },
 
@@ -1286,19 +1513,30 @@ const actions = {
     box.querySelector('[data-delta="-1"]').disabled = next <= 1;
     const id = Number(el.dataset.id);
     clearTimeout(amountTimers[id]);
-    amountTimers[id] = setTimeout(() => {
-      run(sb.from('shopping_items').update({ amount: next }).eq('id', id)).catch(showError);
-    }, 400);
+    const name = box.dataset.name;
+    amountTimers[id] = setTimeout(async () => {
+      try {
+        await run(sb.from('shopping_items').update({ amount: next }).eq('id', id));
+        logActivity('zakupy_zmiany', 'Lista zakupów', `${state.me.name} zmienia liczbę: ${name} – ${next} szt.`, '#/zakupy');
+      } catch (err) {
+        showError(err);
+      }
+    }, 600);
   },
 
   'del-item': async (el) => {
     await run(sb.from('shopping_items').delete().eq('id', Number(el.dataset.id)));
+    logActivity('zakupy_zmiany', 'Lista zakupów', `${state.me.name} usuwa z listy: ${el.dataset.name}`, '#/zakupy');
     render();
   },
 
   'clear-checked': async () => {
     if (!confirm('Usunąć z listy wszystko, co już kupione?')) return;
+    // Zanim usuniesz kupione, oznacz je przy daniach jako „mamy”
+    const bought = await run(sb.from('shopping_items').select('proposal_id, name').eq('checked', true));
+    for (const item of bought) await syncIngredient(item.proposal_id, item.name, true);
     await run(sb.from('shopping_items').delete().eq('checked', true));
+    if (bought.length) logActivity('zakupy_zmiany', 'Lista zakupów', `${state.me.name} usuwa kupione: ${listText(bought.map((i) => i.name))}`, '#/zakupy');
     render();
   },
 
@@ -1317,6 +1555,45 @@ const actions = {
     }
     await saveSubscription(sub);
     toast('Powiadomienia włączone!');
+    render();
+  },
+
+  'check-push': async () => {
+    toast('Sprawdzam powiadomienia…');
+    const lines = [];
+    const installed = !isIOS() || isInstalled();
+    lines.push(['Aplikacja otwarta z ikonki na ekranie początkowym', installed, installed ? '' : 'Otwórz Hungrycatora z ikonki, nie z Safari.']);
+    const permission = 'Notification' in window ? Notification.permission : 'unsupported';
+    const permNote = {
+      denied: 'Zablokowane: Ustawienia iPhone’a → Powiadomienia → Hungrycator.',
+      default: 'Stuknij „Włącz powiadomienia” powyżej.',
+      unsupported: 'Ta przeglądarka nie obsługuje powiadomień.',
+    }[permission] || '';
+    lines.push(['Zgoda na powiadomienia', permission === 'granted', permNote]);
+    let sub = null;
+    try { sub = await currentSubscription(); } catch (e) { /* brak */ }
+    lines.push(['Ten telefon ma adres do powiadomień', !!sub, sub ? '' : 'Stuknij „Włącz powiadomienia” powyżej.']);
+    if (sub) {
+      try {
+        await saveSubscription(sub);
+        lines.push(['Adres telefonu zapisany w bazie', true, '']);
+      } catch (e) {
+        lines.push(['Adres telefonu zapisany w bazie', false, e.message]);
+      }
+    }
+    const { data, error } = await sb.functions.invoke(PUSH_FUNCTION, { body: { event: 'test' } });
+    if (error) {
+      lines.push([`Funkcja ${PUSH_FUNCTION} odpowiada`, false, await describeFunctionError(error)]);
+    } else {
+      lines.push([`Funkcja ${PUSH_FUNCTION} odpowiada`, true, '']);
+      lines.push(['Klucz VAPID w sekretach', data.vapid === 'ok', data.vapid === 'ok' ? '' : data.vapid]);
+      lines.push(['Telefony zapisane na Twoim koncie', data.subscriptions > 0, `zapisane: ${data.subscriptions}`]);
+      const results = data.results || [];
+      const sent = results.some((r) => r.status >= 200 && r.status < 300);
+      const detail = results.map((r) => (r.status ? `kod ${r.status}: ${r.info}` : r.info)).join('; ');
+      lines.push(['Próbne powiadomienie wysłane', sent, sent ? 'Powinno pojawić się za kilka sekund.' : detail || 'Nie było dokąd wysłać.']);
+    }
+    state.pushCheck = lines;
     render();
   },
 
@@ -1420,6 +1697,9 @@ const forms = {
     } else {
       toast('Wysłane! Dodaj od razu składniki.');
     }
+    logActivity('propozycje', `Nowa propozycja: ${MEALS[meal].label.toLowerCase()}`,
+      `${state.me.name} proponuje ${whenText(day, meal)}: ${dish}${comment ? ` – „${shorten(comment, 80)}”` : ''}`,
+      `#/propozycja/${created.id}`, created.id);
     form.reset();
     state.focusAfterPaint = 'f-ing';
     location.hash = `#/propozycja/${created.id}`;
@@ -1430,6 +1710,7 @@ const forms = {
     const name = String(f.get('name')).trim();
     const tags = String(f.get('tags') || '').split(',').map((t) => t.trim().toLowerCase()).filter(Boolean);
     const added = await saveDishIfNew(name, f.get('meal'), tags);
+    if (added) logActivity('baza', 'Nowy pomysł w bazie', `${state.me.name} zapisuje na kiedyś: ${name}`, '#/baza');
     form.reset();
     state.ideaFormOpen = false;
     toast(added ? 'Pomysł zapisany!' : 'To danie już jest w bazie');
@@ -1447,6 +1728,7 @@ const forms = {
     await run(sb.from('ingredients').insert(names.map((name) => ({ proposal_id: proposalId, name, qty: names.length === 1 ? qty : null }))));
     form.reset();
     await rememberIngredients(proposalId);
+    logActivity('skladniki', `Składniki: ${form.dataset.dish}`, `${state.me.name} dodaje: ${listText(names)}`, `#/propozycja/${proposalId}`, proposalId);
     await render();
     document.getElementById('f-ing')?.focus();
   },
@@ -1456,8 +1738,9 @@ const forms = {
     const body = String(f.get('body')).trim();
     if (!body) return;
     form.reset();
-    const msg = await run(sb.from('messages').insert({ proposal_id: Number(form.dataset.id), body }).select().single());
-    notifyPartner({ event: 'message', id: msg.id });
+    const id = Number(form.dataset.id);
+    await run(sb.from('messages').insert({ proposal_id: id, body }));
+    logActivity('wiadomosci', `Wiadomość: ${form.dataset.dish}`, `${state.me.name}: ${body}`, `#/propozycja/${id}`, id);
     render();
   },
 
@@ -1475,14 +1758,15 @@ const forms = {
         // Już jest na liście: zamiast duplikatu zwiększ liczbę sztuk
         same.amount = Math.min(99, (same.amount || 1) + 1);
         await run(sb.from('shopping_items').update({ amount: same.amount }).eq('id', same.id));
+        logActivity('zakupy_zmiany', 'Lista zakupów', `${state.me.name} zmienia liczbę: ${same.name} – ${same.amount} szt.`, '#/zakupy');
         toast(`${same.name}: już na liście, teraz ${same.amount} szt.`);
       } else {
         fresh.push({ name });
       }
     }
     if (fresh.length) {
-      const added = await run(sb.from('shopping_items').insert(fresh).select());
-      notifyPartner({ event: 'shopping', ids: added.map((i) => i.id) });
+      await run(sb.from('shopping_items').insert(fresh));
+      logActivity('zakupy_nowe', 'Lista zakupów', `${state.me.name} dodaje: ${listText(fresh.map((i) => i.name))}`, '#/zakupy');
     }
     form.reset();
     await render();
@@ -1544,7 +1828,20 @@ app.addEventListener('input', (e) => {
 app.addEventListener('change', (e) => {
   if (e.target.name === 'meal' && document.getElementById('suggestions')) updateSuggestions();
   if (e.target.id === 'f-day') updateDayChips();
+  if (e.target.dataset.pref) savePref(e.target.dataset.pref, e.target.checked);
 });
+
+// Włącz/wyłącz kategorię powiadomień
+async function savePref(key, on) {
+  const prefs = { ...(state.me.notify_prefs || {}), [key]: on };
+  state.me.notify_prefs = prefs;
+  try {
+    await run(sb.from('profiles').update({ notify_prefs: prefs }).eq('id', state.me.id));
+    toast(`${KINDS[key].label}: ${on ? 'włączone' : 'wyłączone'}`);
+  } catch (err) {
+    showError(err);
+  }
+}
 
 app.addEventListener('focusout', () => {
   setTimeout(() => {
